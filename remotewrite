@@ -1,0 +1,165 @@
+package remotewrite
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"github.com/gogo/protobuf/proto"
+	"github.com/golang/snappy"
+	"github.com/pkg/errors"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/prompb"
+	"io"
+	"net/http"
+	"net/url"
+	"time"
+)
+
+type HttpClient struct {
+	url     *url.URL
+	Client  *http.Client
+	timeout time.Duration
+}
+
+type MetricPoint struct {
+	Metric string            `json:"metric"`
+	Tags   map[string]string `json:"tags"`
+	Time   int64             `json:"time"`
+	Value  float64           `json:"value"`
+}
+
+func (c *HttpClient) remoteWritePost(req []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.url.String(), bytes.NewReader(req))
+	if err != nil {
+		return err
+	}
+
+	httpReq.Header.Add("Content-Encoding", "snappy")
+	httpReq.Header.Set("Content-Type", "application/x-protobuf")
+	httpReq.Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
+
+	httpResp, err := c.Client.Do(httpReq)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		io.Copy(io.Discard, httpResp.Body)
+		httpResp.Body.Close()
+	}()
+
+	if httpResp.StatusCode != 200 {
+		scanner := bufio.NewScanner(io.LimitReader(httpResp.Body, 512))
+		line := ""
+		if scanner.Scan() {
+			line = scanner.Text()
+		}
+		err = errors.Errorf("server returned HTTP status %s: %s", httpResp.Status, line)
+	}
+
+	return err
+}
+
+func buildWriteRequest(samples []prompb.TimeSeries) ([]byte, error) {
+	req := &prompb.WriteRequest{}
+	req.Timeseries = samples
+
+	data, err := proto.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+
+	compressed := snappy.Encode(nil, data)
+	return compressed, nil
+}
+
+type sample struct {
+	labels labels.Labels
+	t      int64
+	v      float64
+}
+
+const (
+	LABEL_NAME = "__name__"
+)
+
+func (c *HttpClient) RemoteWrite(items []MetricPoint) (err error) {
+	if len(items) == 0 {
+		return nil
+	}
+	//ts := make([]prompb.TimeSeries, 0, len(items))
+	var ts []prompb.TimeSeries
+	for _, v := range items {
+		item, err := convertOne(v)
+		ts = append(ts, item)
+		if err != nil {
+			return err
+		}
+	}
+
+	data, err := buildWriteRequest(ts)
+	if err != nil {
+		return
+	}
+	err = c.remoteWritePost(data)
+	return nil
+}
+
+func convertOne(item MetricPoint) (prompb.TimeSeries, error) {
+	pt := prompb.TimeSeries{}
+	pt.Samples = []prompb.Sample{{}}
+	s := sample{}
+	s.t = item.Time
+	s.v = item.Value
+	nameLs := labels.Label{
+		Name:  LABEL_NAME,
+		Value: item.Metric,
+	}
+	s.labels = append(s.labels, nameLs)
+	for k, v := range item.Tags {
+		if model.LabelNameRE.MatchString(k) {
+			ls := labels.Label{
+				Name:  k,
+				Value: v,
+			}
+			s.labels = append(s.labels, ls)
+		}
+	}
+
+	for _, v := range labelsToLabelsProto(s.labels) {
+		pt.Labels = append(pt.Labels, *v)
+	}
+
+	tsMs := time.Unix(s.t, 0).UnixNano() / 1e6
+	pt.Samples[0].Timestamp = tsMs
+	pt.Samples[0].Value = s.v
+	return pt, nil
+}
+
+func labelsToLabelsProto(labels labels.Labels) []*prompb.Label {
+	result := make([]*prompb.Label, 0, len(labels))
+	for _, l := range labels {
+		result = append(result, &prompb.Label{
+			Name:  l.Name,
+			Value: l.Value,
+		})
+	}
+	return result
+}
+
+func NewClient(ur string, timeout time.Duration) (c *HttpClient, err error) {
+	u, err := url.Parse(ur)
+	if err != nil {
+		return
+	}
+	c = &HttpClient{
+		url:     u,
+		Client:  &http.Client{},
+		timeout: timeout,
+	}
+	return
+}
+ 
